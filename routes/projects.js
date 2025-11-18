@@ -81,6 +81,70 @@ function normalizeColumns(columns = [], options = {}) {
   });
 }
 
+function normalizeExistingColumns(columns = [], options = {}) {
+  const { fallbackToDefault = false, ...rest } = options;
+
+  if (!Array.isArray(columns) || !columns.length) {
+    return fallbackToDefault
+      ? normalizeColumns([], rest)
+      : [];
+  }
+
+  return normalizeColumns(columns, rest);
+}
+
+function normalizeColumnName(name = '') {
+  return (name || '').trim();
+}
+
+function findColumnIndex(columns = [], searchName = '') {
+  const normalizedSearch = normalizeColumnName(searchName).toLowerCase();
+  if (!normalizedSearch)
+    return -1;
+
+  return columns.findIndex((column) =>
+    normalizeColumnName(column.name).toLowerCase() === normalizedSearch
+  );
+}
+
+function sortColumnsByOrder(columns = []) {
+  return [...columns].sort((a, b) => {
+    const orderA = typeof a.order === 'number' ? a.order : Number.MAX_SAFE_INTEGER;
+    const orderB = typeof b.order === 'number' ? b.order : Number.MAX_SAFE_INTEGER;
+
+    if (orderA === orderB)
+      return normalizeColumnName(a.name).localeCompare(normalizeColumnName(b.name));
+
+    return orderA - orderB;
+  });
+}
+
+function reindexColumns(columns = []) {
+  return columns.map((column, idx) => ({
+    ...column,
+    order: idx + 1
+  }));
+}
+
+function sanitizeColumns(columns = [], options = {}) {
+  const preparedColumns = normalizeExistingColumns(columns, options);
+  if (!preparedColumns.length)
+    return [];
+
+  return reindexColumns(sortColumnsByOrder(preparedColumns));
+}
+
+function columnNameExists(columns = [], name, ignoreIndex = -1) {
+  const normalized = normalizeColumnName(name).toLowerCase();
+  if (!normalized)
+    return false;
+
+  return columns.some((column, idx) =>
+    idx !== ignoreIndex &&
+    normalizeColumnName(column.name).toLowerCase() === normalized
+  );
+}
+
 /**
  * @swagger
  * tags:
@@ -197,6 +261,493 @@ router.get('/', authMiddleware, async (req, res) => {
     return sendResponse(res, 200, 'Projects fetched', { projects });
   } catch (err) {
     return handleRouteError(res, 'List projects error', err);
+  }
+});
+
+/**
+ * @swagger
+ * /projects/{projectId}/columns:
+ *   get:
+ *     summary: Fetch board columns/statuses for a project
+ *     tags: [Projects]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: projectId
+ *         schema:
+ *           type: string
+ *         required: true
+ *       - in: query
+ *         name: names
+ *         schema:
+ *           type: string
+ *         description: Comma-separated list of column names to check for existence
+ *     responses:
+ *       200:
+ *         description: Columns fetched
+ *         content:
+ *           application/json:
+ *             schema:
+ *               allOf:
+ *                 - $ref: '#/components/schemas/BaseResponse'
+ *                 - type: object
+ *                   properties:
+ *                     columns:
+ *                       type: array
+ *                       items:
+ *                         $ref: '#/components/schemas/BoardColumn'
+ *                     requestedColumns:
+ *                       type: array
+ *                       items:
+ *                         type: object
+ *                         properties:
+ *                           name:
+ *                             type: string
+ *                           exists:
+ *                             type: boolean
+ *                           column:
+ *                             allOf:
+ *                               - $ref: '#/components/schemas/BoardColumn'
+ *                               - nullable: true
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Project not found
+ *       500:
+ *         description: Server error
+ */
+router.get('/:projectId/columns', authMiddleware, async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    const { names } = req.query || {};
+
+    const project = await Project.findOne(
+      { _id: projectId, owner: req.user.userId },
+      { columns: 1 }
+    ).lean();
+
+    if (!project)
+      return sendResponse(res, 404, 'Project not found');
+
+    const columns = sortColumnsByOrder(
+      normalizeExistingColumns(project.columns || [], { enforceDefaultCard: false })
+    );
+
+    const extra = { columns };
+
+    if (typeof names === 'string' && names.trim()) {
+      const requestedNames = Array.from(
+        new Set(
+          names
+            .split(',')
+            .map((value) => normalizeColumnName(value))
+            .filter(Boolean)
+        )
+      );
+
+      if (requestedNames.length) {
+        extra.requestedColumns = requestedNames.map((targetName) => {
+          const column = columns.find(
+            (col) => normalizeColumnName(col.name).toLowerCase() === targetName.toLowerCase()
+          );
+
+          return {
+            name: targetName,
+            exists: Boolean(column),
+            column: column || null
+          };
+        });
+      }
+    }
+
+    return sendResponse(res, 200, 'Board columns fetched', extra);
+  } catch (err) {
+    return handleRouteError(res, 'List project columns error', err);
+  }
+});
+
+/**
+ * @swagger
+ * /projects/{projectId}/columns:
+ *   post:
+ *     summary: Create a new board column/status
+ *     tags: [Projects]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: projectId
+ *         schema:
+ *           type: string
+ *         required: true
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - name
+ *             properties:
+ *               name:
+ *                 type: string
+ *               order:
+ *                 type: integer
+ *                 description: Desired order position (1-based)
+ *               cards:
+ *                 type: array
+ *                 items:
+ *                   $ref: '#/components/schemas/BoardCard'
+ *     responses:
+ *       201:
+ *         description: Column created
+ *       400:
+ *         description: Validation error
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Project not found
+ *       409:
+ *         description: Column already exists
+ *       500:
+ *         description: Server error
+ */
+router.post('/:projectId/columns', authMiddleware, async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    const { name, order, cards } = req.body;
+
+    const normalizedName = normalizeColumnName(name);
+
+    if (!normalizedName)
+      return sendResponse(res, 400, 'Column name is required');
+
+    if (cards !== undefined && !Array.isArray(cards))
+      return sendResponse(res, 400, 'Cards must be an array');
+
+    const project = await Project.findOne({ _id: projectId, owner: req.user.userId }).lean();
+
+    if (!project)
+      return sendResponse(res, 404, 'Project not found');
+
+    let columns = sanitizeColumns(project.columns || [], { enforceDefaultCard: false });
+
+    if (columnNameExists(columns, normalizedName))
+      return sendResponse(res, 409, 'Column already exists');
+
+    const [preparedColumn] = normalizeColumns(
+      [{ name: normalizedName, order, cards }],
+      { enforceDefaultCard: false }
+    );
+
+    const parsedOrder = Number(order);
+    const hasOrder = Number.isFinite(parsedOrder) && parsedOrder > 0;
+    const insertionIndex = hasOrder
+      ? Math.min(Math.floor(parsedOrder) - 1, columns.length)
+      : columns.length;
+
+    columns.splice(insertionIndex, 0, preparedColumn);
+
+    const updatedColumns = reindexColumns(columns);
+
+    const updatedProject = await Project.findOneAndUpdate(
+      { _id: projectId, owner: req.user.userId },
+      { columns: updatedColumns },
+      { new: true }
+    );
+
+    return sendResponse(res, 201, 'Column created', {
+      column: updatedProject.columns[insertionIndex],
+      columns: updatedProject.columns
+    });
+  } catch (err) {
+    return handleRouteError(res, 'Create column error', err);
+  }
+});
+
+/**
+ * @swagger
+ * /projects/{projectId}/columns/{columnName}:
+ *   get:
+ *     summary: Fetch a single board column/status
+ *     tags: [Projects]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: projectId
+ *         schema:
+ *           type: string
+ *         required: true
+ *       - in: path
+ *         name: columnName
+ *         schema:
+ *           type: string
+ *         required: true
+ *     responses:
+ *       200:
+ *         description: Column fetched
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Project or column not found
+ *       500:
+ *         description: Server error
+ */
+router.get('/:projectId/columns/:columnName', authMiddleware, async (req, res) => {
+  try {
+    const { projectId, columnName } = req.params;
+
+    const project = await Project.findOne(
+      { _id: projectId, owner: req.user.userId },
+      { columns: 1 }
+    ).lean();
+
+    if (!project)
+      return sendResponse(res, 404, 'Project not found');
+
+    const columns = normalizeExistingColumns(project.columns || [], { enforceDefaultCard: false });
+    const columnIndex = findColumnIndex(columns, columnName);
+
+    if (columnIndex === -1)
+      return sendResponse(res, 404, 'Column not found', { exists: false });
+
+    return sendResponse(res, 200, 'Column fetched', { column: columns[columnIndex] });
+  } catch (err) {
+    return handleRouteError(res, 'Get column error', err);
+  }
+});
+
+/**
+ * @swagger
+ * /projects/{projectId}/columns/{columnName}:
+ *   put:
+ *     summary: Update an existing board column/status
+ *     tags: [Projects]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: projectId
+ *         schema:
+ *           type: string
+ *         required: true
+ *       - in: path
+ *         name: columnName
+ *         schema:
+ *           type: string
+ *         required: true
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               name:
+ *                 type: string
+ *               order:
+ *                 type: integer
+ *               cards:
+ *                 type: array
+ *                 items:
+ *                   $ref: '#/components/schemas/BoardCard'
+ *     responses:
+ *       200:
+ *         description: Column updated
+ *       400:
+ *         description: Validation error
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Project or column not found
+ *       409:
+ *         description: Duplicate column name
+ *       500:
+ *         description: Server error
+ */
+router.put('/:projectId/columns/:columnName', authMiddleware, async (req, res) => {
+  try {
+    const { projectId, columnName } = req.params;
+    const { name, order, cards } = req.body;
+
+    const hasUpdates =
+      typeof name === 'string' ||
+      (order !== undefined && order !== null) ||
+      Array.isArray(cards);
+
+    if (!hasUpdates)
+      return sendResponse(res, 400, 'Provide at least one field to update');
+
+    if (cards !== undefined && cards !== null && !Array.isArray(cards))
+      return sendResponse(res, 400, 'Cards must be an array');
+
+    const project = await Project.findOne({ _id: projectId, owner: req.user.userId }).lean();
+
+    if (!project)
+      return sendResponse(res, 404, 'Project not found');
+
+    let columns = sanitizeColumns(project.columns || [], { enforceDefaultCard: false });
+    const columnIndex = findColumnIndex(columns, columnName);
+
+    if (columnIndex === -1)
+      return sendResponse(res, 404, 'Column not found');
+
+    const column = columns[columnIndex];
+
+    if (typeof name === 'string') {
+      const newName = normalizeColumnName(name);
+      if (!newName)
+        return sendResponse(res, 400, 'Column name cannot be empty');
+
+      if (columnNameExists(columns, newName, columnIndex))
+        return sendResponse(res, 409, 'Column with this name already exists');
+
+      column.name = newName;
+      column.cards = column.cards.map((card) => ({
+        ...card,
+        status: newName
+      }));
+    }
+
+    if (Array.isArray(cards)) {
+      const [normalizedColumn] = normalizeColumns(
+        [{ ...column, cards }],
+        { enforceDefaultCard: false }
+      );
+      column.cards = normalizedColumn.cards;
+    }
+
+    if (order !== undefined && order !== null) {
+      const parsedOrder = Number(order);
+
+      if (!Number.isFinite(parsedOrder))
+        return sendResponse(res, 400, 'Order must be a number');
+
+      const nextColumns = columns.slice();
+      const [movedColumn] = nextColumns.splice(columnIndex, 1);
+      const targetIndex = Math.min(
+        Math.max(Math.floor(parsedOrder) - 1, 0),
+        nextColumns.length
+      );
+      nextColumns.splice(targetIndex, 0, movedColumn);
+      columns = nextColumns;
+    }
+
+    const updatedColumns = reindexColumns(columns);
+
+    const updatedProject = await Project.findOneAndUpdate(
+      { _id: projectId, owner: req.user.userId },
+      { columns: updatedColumns },
+      { new: true }
+    );
+
+    return sendResponse(res, 200, 'Column updated', { columns: updatedProject.columns });
+  } catch (err) {
+    return handleRouteError(res, 'Update column error', err);
+  }
+});
+
+/**
+ * @swagger
+ * /projects/{projectId}/columns/{columnName}:
+ *   delete:
+ *     summary: Delete a board column/status
+ *     tags: [Projects]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: projectId
+ *         schema:
+ *           type: string
+ *         required: true
+ *       - in: path
+ *         name: columnName
+ *         schema:
+ *           type: string
+ *         required: true
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               targetColumn:
+ *                 type: string
+ *                 description: Column to move cards into before deletion
+ *     responses:
+ *       200:
+ *         description: Column deleted
+ *       400:
+ *         description: Validation error
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Project or column not found
+ *       500:
+ *         description: Server error
+ */
+router.delete('/:projectId/columns/:columnName', authMiddleware, async (req, res) => {
+  try {
+    const { projectId, columnName } = req.params;
+    const { targetColumn } = req.body || {};
+
+    const project = await Project.findOne({ _id: projectId, owner: req.user.userId }).lean();
+
+    if (!project)
+      return sendResponse(res, 404, 'Project not found');
+
+    let columns = sanitizeColumns(project.columns || [], { enforceDefaultCard: false });
+    const columnIndex = findColumnIndex(columns, columnName);
+
+    if (columnIndex === -1)
+      return sendResponse(res, 404, 'Column not found');
+
+    const [removedColumn] = columns.splice(columnIndex, 1);
+
+    const hasCards = Array.isArray(removedColumn.cards) && removedColumn.cards.length;
+
+    if (hasCards) {
+      const normalizedTarget = normalizeColumnName(targetColumn);
+
+      if (!normalizedTarget)
+        return sendResponse(
+          res,
+          400,
+          'Column contains cards. Provide targetColumn or empty it before deletion'
+        );
+
+      const targetIndex = findColumnIndex(columns, normalizedTarget);
+
+      if (targetIndex === -1)
+        return sendResponse(res, 400, 'Target column not found');
+
+      const destinationName = columns[targetIndex].name;
+      const migratedCards = removedColumn.cards.map((card) => ({
+        ...card,
+        status: destinationName
+      }));
+
+      columns[targetIndex].cards = [...columns[targetIndex].cards, ...migratedCards];
+    }
+
+    const updatedColumns = reindexColumns(columns);
+
+    const updatedProject = await Project.findOneAndUpdate(
+      { _id: projectId, owner: req.user.userId },
+      { columns: updatedColumns },
+      { new: true }
+    );
+
+    return sendResponse(res, 200, 'Column deleted', {
+      removedColumn: removedColumn.name,
+      columns: updatedProject.columns
+    });
+  } catch (err) {
+    return handleRouteError(res, 'Delete column error', err);
   }
 });
 
