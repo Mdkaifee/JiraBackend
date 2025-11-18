@@ -185,7 +185,7 @@ router.post('/signup/verify', async (req, res) => {
 
     // Create JWT token
     const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, {
-      expiresIn: '24h'
+      expiresIn: '12h'
     });
 
     // SAVE TOKEN IN DB
@@ -426,7 +426,7 @@ router.post('/login/verify', async (req, res) => {
     await Otp.deleteMany({ email, type: 'login' });
 
     const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, {
-      expiresIn: '1h'
+      expiresIn: '12h'
     });
 
     // SAVE TOKEN IN DB
