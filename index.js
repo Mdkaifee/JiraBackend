@@ -6,6 +6,8 @@ const swaggerUi = require('swagger-ui-express');
 
 const connectDB = require('./db');
 const authRoutes = require('./routes/auth');
+const projectRoutes = require('./routes/projects');
+const userRoutes = require('./routes/users');
 const swaggerSpec = require('./swagger');
 
 const app = express();
@@ -17,6 +19,8 @@ app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, { explorer: true 
 
 // routes
 app.use('/auth', authRoutes);
+app.use('/projects', projectRoutes);
+app.use('/users', userRoutes);
 
 app.get('/', (req, res) => {
   res.send('API is running');
