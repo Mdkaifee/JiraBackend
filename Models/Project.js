@@ -20,6 +20,28 @@ const boardColumnSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const memberSchema = new mongoose.Schema(
+  {
+    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    role: { type: String, enum: ['owner', 'collaborator'], default: 'collaborator' },
+    addedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    joinedAt: { type: Date, default: Date.now }
+  },
+  { _id: false }
+);
+
+const inviteSchema = new mongoose.Schema({
+  email: { type: String, required: true, lowercase: true },
+  invitedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  status: {
+    type: String,
+    enum: ['pending', 'accepted', 'cancelled'],
+    default: 'pending'
+  },
+  invitedAt: { type: Date, default: Date.now },
+  acceptedAt: { type: Date }
+});
+
 const projectSchema = new mongoose.Schema(
   {
     owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
@@ -36,7 +58,9 @@ const projectSchema = new mongoose.Schema(
       default: 'scrum'
     },
     currentSprint: { type: String, default: 'Scrum 1' },
-    columns: { type: [boardColumnSchema], default: [] }
+    columns: { type: [boardColumnSchema], default: [] },
+    members: { type: [memberSchema], default: [] },
+    invites: { type: [inviteSchema], default: [] }
   },
   { timestamps: true }
 );

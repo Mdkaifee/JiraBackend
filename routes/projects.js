@@ -1,5 +1,6 @@
 const express = require('express');
 const Project = require('../models/Project');
+const User = require('../models/User');
 const authMiddleware = require('../middleware/authMiddleware');
 
 const router = express.Router();
@@ -145,6 +146,35 @@ function columnNameExists(columns = [], name, ignoreIndex = -1) {
   );
 }
 
+function buildProjectAccessQuery(projectId, userId) {
+  return {
+    _id: projectId,
+    $or: [
+      { owner: userId },
+      { 'members.user': userId }
+    ]
+  };
+}
+
+function isProjectMember(project, userId) {
+  if (!project || !userId)
+    return false;
+
+  const targetId = String(userId);
+  if (project.owner && String(project.owner) === targetId)
+    return true;
+
+  return Array.isArray(project.members) &&
+    project.members.some((member) => member.user && String(member.user) === targetId);
+}
+
+function normalizeEmail(email = '') {
+  if (typeof email !== 'string')
+    return '';
+
+  return email.trim().toLowerCase();
+}
+
 /**
  * @swagger
  * tags:
@@ -213,6 +243,12 @@ router.post('/', authMiddleware, async (req, res) => {
 
     const project = await Project.create({
       owner: req.user.userId,
+      members: [{
+        user: req.user.userId,
+        role: 'owner',
+        addedBy: req.user.userId,
+        joinedAt: new Date()
+      }],
       name,
       description,
       status,
@@ -257,10 +293,254 @@ router.post('/', authMiddleware, async (req, res) => {
  */
 router.get('/', authMiddleware, async (req, res) => {
   try {
-    const projects = await Project.find({ owner: req.user.userId }).sort({ createdAt: -1 });
+    const projects = await Project.find({
+      $or: [
+        { owner: req.user.userId },
+        { 'members.user': req.user.userId }
+      ]
+    }).sort({ createdAt: -1 });
+
     return sendResponse(res, 200, 'Projects fetched', { projects });
   } catch (err) {
     return handleRouteError(res, 'List projects error', err);
+  }
+});
+
+/**
+ * @swagger
+ * /projects/invitations:
+ *   get:
+ *     summary: List pending invitations for the authenticated user
+ *     tags: [Projects]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Invitations fetched
+ *         content:
+ *           application/json:
+ *             schema:
+ *               allOf:
+ *                 - $ref: '#/components/schemas/BaseResponse'
+ *                 - type: object
+ *                   properties:
+ *                     invites:
+ *                       type: array
+ *                       items:
+ *                         $ref: '#/components/schemas/ProjectInviteSummary'
+ *       401:
+ *         description: Unauthorized
+ *       500:
+ *         description: Server error
+ */
+router.get('/invitations', authMiddleware, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId, { email: 1, fullName: 1 });
+    if (!user || !user.email)
+      return sendResponse(res, 404, 'User profile not found');
+
+    const email = normalizeEmail(user.email);
+
+    const projects = await Project.find({
+      invites: { $elemMatch: { email, status: 'pending' } }
+    })
+      .select({ name: 1, description: 1, invites: 1 })
+      .populate('invites.invitedBy', 'email fullName');
+
+    const invites = [];
+
+    projects.forEach((project) => {
+      (project.invites || [])
+        .filter((invite) => invite.email === email && invite.status === 'pending')
+        .forEach((invite) => {
+          invites.push({
+            inviteId: invite._id,
+            projectId: project._id,
+            projectName: project.name,
+            invitedBy: invite.invitedBy,
+            invitedAt: invite.invitedAt
+          });
+        });
+    });
+
+    return sendResponse(res, 200, 'Pending invitations fetched', { invites });
+  } catch (err) {
+    return handleRouteError(res, 'List invitations error', err);
+  }
+});
+
+/**
+ * @swagger
+ * /projects/{projectId}/invite:
+ *   post:
+ *     summary: Invite a user by email or add an existing user to the project
+ *     tags: [Projects]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: projectId
+ *         schema:
+ *           type: string
+ *         required: true
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 format: email
+ *     responses:
+ *       200:
+ *         description: Invitation created or user added
+ *       400:
+ *         description: Validation error
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Project not found
+ *       500:
+ *         description: Server error
+ */
+router.post('/:projectId/invite', authMiddleware, async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    const { email } = req.body || {};
+
+    const normalizedEmail = normalizeEmail(email);
+
+    if (!normalizedEmail)
+      return sendResponse(res, 400, 'Valid email is required');
+
+    const project = await Project.findOne(buildProjectAccessQuery(projectId, req.user.userId));
+    if (!project)
+      return sendResponse(res, 404, 'Project not found');
+
+    const existingUser = await User.findOne({ email: normalizedEmail });
+
+    if (existingUser) {
+      if (isProjectMember(project, existingUser._id))
+        return sendResponse(res, 400, 'User is already part of this project');
+
+      project.members = Array.isArray(project.members) ? project.members : [];
+      project.members.push({
+        user: existingUser._id,
+        role: 'collaborator',
+        addedBy: req.user.userId,
+        joinedAt: new Date()
+      });
+
+      (project.invites || []).forEach((invite) => {
+        if (invite.email === normalizedEmail && invite.status === 'pending') {
+          invite.status = 'accepted';
+          invite.acceptedAt = new Date();
+        }
+      });
+
+      await project.save();
+
+      return sendResponse(res, 200, 'User added to project', {
+        memberId: existingUser._id
+      });
+    }
+
+    const pendingInvite = (project.invites || []).find(
+      (invite) => invite.email === normalizedEmail && invite.status === 'pending'
+    );
+
+    if (pendingInvite)
+      return sendResponse(res, 400, 'An invitation is already pending for this email');
+
+    project.invites = Array.isArray(project.invites) ? project.invites : [];
+    project.invites.push({
+      email: normalizedEmail,
+      invitedBy: req.user.userId,
+      status: 'pending',
+      invitedAt: new Date()
+    });
+
+    await project.save();
+
+    return sendResponse(res, 200, 'Invitation sent', {
+      inviteEmail: normalizedEmail
+    });
+  } catch (err) {
+    return handleRouteError(res, 'Invite collaborator error', err);
+  }
+});
+
+/**
+ * @swagger
+ * /projects/{projectId}/accept-invite:
+ *   post:
+ *     summary: Accept an invitation to join a project
+ *     tags: [Projects]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: projectId
+ *         schema:
+ *           type: string
+ *         required: true
+ *     responses:
+ *       200:
+ *         description: Invitation accepted
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Invitation not found
+ *       500:
+ *         description: Server error
+ */
+router.post('/:projectId/accept-invite', authMiddleware, async (req, res) => {
+  try {
+    const { projectId } = req.params;
+
+    const user = await User.findById(req.user.userId, { email: 1 });
+    if (!user || !user.email)
+      return sendResponse(res, 404, 'User profile not found');
+
+    const email = normalizeEmail(user.email);
+
+    const project = await Project.findOne({
+      _id: projectId,
+      invites: { $elemMatch: { email, status: 'pending' } }
+    });
+
+    if (!project)
+      return sendResponse(res, 404, 'Invitation not found for this project');
+
+    const invite = (project.invites || []).find(
+      (entry) => entry.email === email && entry.status === 'pending'
+    );
+
+    if (!invite)
+      return sendResponse(res, 404, 'Invitation not found');
+
+    if (!isProjectMember(project, user._id)) {
+      project.members = Array.isArray(project.members) ? project.members : [];
+      project.members.push({
+        user: user._id,
+        role: 'collaborator',
+        addedBy: invite.invitedBy || req.user.userId,
+        joinedAt: new Date()
+      });
+    }
+
+    invite.status = 'accepted';
+    invite.acceptedAt = new Date();
+
+    await project.save();
+
+    return sendResponse(res, 200, 'Invitation accepted');
+  } catch (err) {
+    return handleRouteError(res, 'Accept invitation error', err);
   }
 });
 
@@ -323,7 +603,7 @@ router.get('/:projectId/columns', authMiddleware, async (req, res) => {
     const { names } = req.query || {};
 
     const project = await Project.findOne(
-      { _id: projectId, owner: req.user.userId },
+      buildProjectAccessQuery(projectId, req.user.userId),
       { columns: 1 }
     ).lean();
 
@@ -426,7 +706,9 @@ router.post('/:projectId/columns', authMiddleware, async (req, res) => {
     if (cards !== undefined && !Array.isArray(cards))
       return sendResponse(res, 400, 'Cards must be an array');
 
-    const project = await Project.findOne({ _id: projectId, owner: req.user.userId }).lean();
+    const project = await Project.findOne(
+      buildProjectAccessQuery(projectId, req.user.userId)
+    ).lean();
 
     if (!project)
       return sendResponse(res, 404, 'Project not found');
@@ -452,7 +734,7 @@ router.post('/:projectId/columns', authMiddleware, async (req, res) => {
     const updatedColumns = reindexColumns(columns);
 
     const updatedProject = await Project.findOneAndUpdate(
-      { _id: projectId, owner: req.user.userId },
+      buildProjectAccessQuery(projectId, req.user.userId),
       { columns: updatedColumns },
       { new: true }
     );
@@ -500,7 +782,7 @@ router.get('/:projectId/columns/:columnName', authMiddleware, async (req, res) =
     const { projectId, columnName } = req.params;
 
     const project = await Project.findOne(
-      { _id: projectId, owner: req.user.userId },
+      buildProjectAccessQuery(projectId, req.user.userId),
       { columns: 1 }
     ).lean();
 
@@ -583,7 +865,9 @@ router.put('/:projectId/columns/:columnName', authMiddleware, async (req, res) =
     if (cards !== undefined && cards !== null && !Array.isArray(cards))
       return sendResponse(res, 400, 'Cards must be an array');
 
-    const project = await Project.findOne({ _id: projectId, owner: req.user.userId }).lean();
+    const project = await Project.findOne(
+      buildProjectAccessQuery(projectId, req.user.userId)
+    ).lean();
 
     if (!project)
       return sendResponse(res, 404, 'Project not found');
@@ -638,7 +922,7 @@ router.put('/:projectId/columns/:columnName', authMiddleware, async (req, res) =
     const updatedColumns = reindexColumns(columns);
 
     const updatedProject = await Project.findOneAndUpdate(
-      { _id: projectId, owner: req.user.userId },
+      buildProjectAccessQuery(projectId, req.user.userId),
       { columns: updatedColumns },
       { new: true }
     );
@@ -695,7 +979,9 @@ router.delete('/:projectId/columns/:columnName', authMiddleware, async (req, res
     const { projectId, columnName } = req.params;
     const { targetColumn } = req.body || {};
 
-    const project = await Project.findOne({ _id: projectId, owner: req.user.userId }).lean();
+    const project = await Project.findOne(
+      buildProjectAccessQuery(projectId, req.user.userId)
+    ).lean();
 
     if (!project)
       return sendResponse(res, 404, 'Project not found');
@@ -737,7 +1023,7 @@ router.delete('/:projectId/columns/:columnName', authMiddleware, async (req, res
     const updatedColumns = reindexColumns(columns);
 
     const updatedProject = await Project.findOneAndUpdate(
-      { _id: projectId, owner: req.user.userId },
+      buildProjectAccessQuery(projectId, req.user.userId),
       { columns: updatedColumns },
       { new: true }
     );
@@ -787,7 +1073,9 @@ router.delete('/:projectId/columns/:columnName', authMiddleware, async (req, res
 router.get('/:projectId', authMiddleware, async (req, res) => {
   try {
     const { projectId } = req.params;
-    const project = await Project.findOne({ _id: projectId, owner: req.user.userId });
+    const project = await Project.findOne(
+      buildProjectAccessQuery(projectId, req.user.userId)
+    );
 
     if (!project)
       return sendResponse(res, 404, 'Project not found');
@@ -864,7 +1152,7 @@ router.put('/:projectId', authMiddleware, async (req, res) => {
       updates.columns = normalizeColumns(columns, { enforceDefaultCard: false });
 
     const project = await Project.findOneAndUpdate(
-      { _id: projectId, owner: req.user.userId },
+      buildProjectAccessQuery(projectId, req.user.userId),
       updates,
       { new: true }
     );

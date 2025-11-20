@@ -69,6 +69,45 @@ const swaggerDefinition = {
           }
         }
       },
+      ProjectMember: {
+        type: 'object',
+        properties: {
+          user: { type: 'string' },
+          role: { type: 'string', enum: ['owner', 'collaborator'] },
+          addedBy: { type: 'string' },
+          joinedAt: { type: 'string', format: 'date-time' }
+        }
+      },
+      ProjectInviteEntry: {
+        type: 'object',
+        properties: {
+          _id: { type: 'string' },
+          email: { type: 'string', format: 'email' },
+          status: { type: 'string', enum: ['pending', 'accepted', 'cancelled'] },
+          invitedBy: { type: 'string' },
+          invitedAt: { type: 'string', format: 'date-time' },
+          acceptedAt: {
+            type: 'string',
+            format: 'date-time',
+            nullable: true
+          }
+        }
+      },
+      ProjectInviteSummary: {
+        type: 'object',
+        properties: {
+          inviteId: { type: 'string' },
+          projectId: { type: 'string' },
+          projectName: { type: 'string' },
+          invitedBy: {
+            allOf: [
+              { $ref: '#/components/schemas/User' },
+              { nullable: true }
+            ]
+          },
+          invitedAt: { type: 'string', format: 'date-time' }
+        }
+      },
       Project: {
         type: 'object',
         properties: {
@@ -81,6 +120,14 @@ const swaggerDefinition = {
           columns: {
             type: 'array',
             items: { $ref: '#/components/schemas/BoardColumn' }
+          },
+          members: {
+            type: 'array',
+            items: { $ref: '#/components/schemas/ProjectMember' }
+          },
+          invites: {
+            type: 'array',
+            items: { $ref: '#/components/schemas/ProjectInviteEntry' }
           },
           createdAt: { type: 'string', format: 'date-time' },
           updatedAt: { type: 'string', format: 'date-time' }
