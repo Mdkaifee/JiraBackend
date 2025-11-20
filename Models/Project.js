@@ -39,7 +39,8 @@ const inviteSchema = new mongoose.Schema({
     default: 'pending'
   },
   invitedAt: { type: Date, default: Date.now },
-  acceptedAt: { type: Date }
+  acceptedAt: { type: Date },
+  cancelledAt: { type: Date }
 });
 
 const projectSchema = new mongoose.Schema(

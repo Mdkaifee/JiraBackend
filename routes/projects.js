@@ -1,4 +1,5 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const Project = require('../models/Project');
 const User = require('../models/User');
 const authMiddleware = require('../middleware/authMiddleware');
@@ -168,11 +169,104 @@ function isProjectMember(project, userId) {
     project.members.some((member) => member.user && String(member.user) === targetId);
 }
 
+function isProjectOwner(project, userId) {
+  if (!project || !userId)
+    return false;
+
+  return project.owner && String(project.owner) === String(userId);
+}
+
 function normalizeEmail(email = '') {
   if (typeof email !== 'string')
     return '';
 
   return email.trim().toLowerCase();
+}
+
+function isValidObjectId(id) {
+  return mongoose.Types.ObjectId.isValid(id);
+}
+
+function formatInvalidEntry(entry) {
+  if (entry === undefined || entry === null)
+    return '[empty]';
+
+  if (typeof entry === 'string')
+    return entry || '[empty]';
+
+  if (typeof entry === 'number' || typeof entry === 'boolean')
+    return String(entry);
+
+  if (typeof entry === 'object') {
+    if (typeof entry.email === 'string')
+      return entry.email || '[empty]';
+
+    try {
+      const serialized = JSON.stringify(entry);
+      return serialized.length ? serialized : '[invalid]';
+    } catch (err) {
+      return '[invalid]';
+    }
+  }
+
+  return String(entry);
+}
+
+function collectEmailsFromPayload(primaryEmail, emailList) {
+  const requested = [];
+  const invalidRawEntries = [];
+
+  const processValue = (value) => {
+    if (value === undefined || value === null)
+      return;
+
+    if (typeof value === 'string') {
+      requested.push(value);
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      value.forEach(processValue);
+      return;
+    }
+
+    if (typeof value === 'object') {
+      if (typeof value.email === 'string') {
+        requested.push(value.email);
+        return;
+      }
+
+      invalidRawEntries.push(value);
+      return;
+    }
+
+    invalidRawEntries.push(value);
+  };
+
+  processValue(emailList);
+  processValue(primaryEmail);
+
+  const normalizedEntries = requested.map((raw) => ({
+    raw,
+    normalized: normalizeEmail(raw)
+  }));
+
+  const invalidEmails = [
+    ...invalidRawEntries.map((entry) => formatInvalidEntry(entry)),
+    ...normalizedEntries
+      .filter((entry) => !entry.normalized)
+      .map((entry) => entry.raw || '[empty]')
+  ];
+
+  const normalizedEmails = [
+    ...new Set(
+      normalizedEntries
+        .map((entry) => entry.normalized)
+        .filter(Boolean)
+    )
+  ];
+
+  return { normalizedEmails, invalidEmails };
 }
 
 /**
@@ -231,6 +325,8 @@ function normalizeEmail(email = '') {
  *         description: Validation error
  *       401:
  *         description: Unauthorized
+ *       403:
+ *         description: Forbidden
  *       500:
  *         description: Server error
  */
@@ -288,6 +384,8 @@ router.post('/', authMiddleware, async (req, res) => {
  *                         $ref: '#/components/schemas/Project'
  *       401:
  *         description: Unauthorized
+ *       403:
+ *         description: Forbidden
  *       500:
  *         description: Server error
  */
@@ -373,7 +471,7 @@ router.get('/invitations', authMiddleware, async (req, res) => {
  * @swagger
  * /projects/{projectId}/invite:
  *   post:
- *     summary: Invite a user by email or add an existing user to the project
+ *     summary: Invite one or more users by email or add existing users to the project
  *     tags: [Projects]
  *     security:
  *       - bearerAuth: []
@@ -389,12 +487,20 @@ router.get('/invitations', authMiddleware, async (req, res) => {
  *         application/json:
  *           schema:
  *             type: object
- *             required:
- *               - email
+ *             anyOf:
+ *               - required: [email]
+ *               - required: [emails]
  *             properties:
  *               email:
  *                 type: string
  *                 format: email
+ *                 description: Single email to invite
+ *               emails:
+ *                 type: array
+ *                 description: Array of email addresses to invite
+ *                 items:
+ *                   type: string
+ *                   format: email
  *     responses:
  *       200:
  *         description: Invitation created or user added
@@ -402,6 +508,8 @@ router.get('/invitations', authMiddleware, async (req, res) => {
  *         description: Validation error
  *       401:
  *         description: Unauthorized
+ *       403:
+ *         description: Forbidden
  *       404:
  *         description: Project not found
  *       500:
@@ -410,67 +518,276 @@ router.get('/invitations', authMiddleware, async (req, res) => {
 router.post('/:projectId/invite', authMiddleware, async (req, res) => {
   try {
     const { projectId } = req.params;
-    const { email } = req.body || {};
+    const { email, emails } = req.body || {};
 
-    const normalizedEmail = normalizeEmail(email);
+    const requestedEmails = [];
+    if (Array.isArray(emails))
+      requestedEmails.push(...emails);
+    if (typeof email === 'string' && email)
+      requestedEmails.push(email);
 
-    if (!normalizedEmail)
-      return sendResponse(res, 400, 'Valid email is required');
+    const normalizedEntries = requestedEmails.map((raw) => ({
+      raw,
+      normalized: normalizeEmail(raw)
+    }));
+    const invalidEmails = normalizedEntries
+      .filter((entry) => !entry.normalized)
+      .map((entry) => entry.raw);
+    const normalizedEmails = [
+      ...new Set(
+        normalizedEntries
+          .map((entry) => entry.normalized)
+          .filter(Boolean)
+      )
+    ];
+
+    if (!normalizedEmails.length)
+      return sendResponse(res, 400, 'At least one valid email is required');
 
     const project = await Project.findOne(buildProjectAccessQuery(projectId, req.user.userId));
     if (!project)
       return sendResponse(res, 404, 'Project not found');
 
-    const existingUser = await User.findOne({ email: normalizedEmail });
+    if (!isProjectOwner(project, req.user.userId))
+      return sendResponse(res, 403, 'Only the project owner can send invitations');
 
-    if (existingUser) {
-      if (isProjectMember(project, existingUser._id))
-        return sendResponse(res, 400, 'User is already part of this project');
+    project.members = Array.isArray(project.members) ? project.members : [];
+    project.invites = Array.isArray(project.invites) ? project.invites : [];
 
-      project.members = Array.isArray(project.members) ? project.members : [];
-      project.members.push({
-        user: existingUser._id,
-        role: 'collaborator',
-        addedBy: req.user.userId,
-        joinedAt: new Date()
-      });
+    const existingUsers = await User.find({ email: { $in: normalizedEmails } });
+    const userByEmail = new Map(
+      existingUsers.map((user) => [normalizeEmail(user.email), user])
+    );
 
-      (project.invites || []).forEach((invite) => {
-        if (invite.email === normalizedEmail && invite.status === 'pending') {
+    const markInviteAccepted = (targetEmail) => {
+      project.invites.forEach((invite) => {
+        if (invite.email === targetEmail && invite.status === 'pending') {
           invite.status = 'accepted';
           invite.acceptedAt = new Date();
         }
       });
+    };
 
-      await project.save();
+    const membersToAdd = [];
+    const invitesToAdd = [];
+    const results = {
+      addedMembers: [],
+      invitationsSent: [],
+      alreadyMembers: [],
+      alreadyInvited: [],
+      invalidEmails
+    };
 
-      return sendResponse(res, 200, 'User added to project', {
-        memberId: existingUser._id
+    normalizedEmails.forEach((normalizedEmail) => {
+      const existingUser = userByEmail.get(normalizedEmail);
+
+      if (existingUser) {
+        const alreadyScheduled =
+          membersToAdd.some((member) => String(member.user) === String(existingUser._id)) ||
+          isProjectMember(project, existingUser._id);
+
+        if (alreadyScheduled) {
+          results.alreadyMembers.push(normalizedEmail);
+          return;
+        }
+
+        membersToAdd.push({
+          user: existingUser._id,
+          role: 'collaborator',
+          addedBy: req.user.userId,
+          joinedAt: new Date()
+        });
+
+        markInviteAccepted(normalizedEmail);
+        results.addedMembers.push(normalizedEmail);
+        return;
+      }
+
+      const hasPendingInvite = project.invites.some(
+        (invite) => invite.email === normalizedEmail && invite.status === 'pending'
+      );
+
+      if (hasPendingInvite) {
+        results.alreadyInvited.push(normalizedEmail);
+        return;
+      }
+
+      invitesToAdd.push({
+        email: normalizedEmail,
+        invitedBy: req.user.userId,
+        status: 'pending',
+        invitedAt: new Date()
       });
-    }
-
-    const pendingInvite = (project.invites || []).find(
-      (invite) => invite.email === normalizedEmail && invite.status === 'pending'
-    );
-
-    if (pendingInvite)
-      return sendResponse(res, 400, 'An invitation is already pending for this email');
-
-    project.invites = Array.isArray(project.invites) ? project.invites : [];
-    project.invites.push({
-      email: normalizedEmail,
-      invitedBy: req.user.userId,
-      status: 'pending',
-      invitedAt: new Date()
+      results.invitationsSent.push(normalizedEmail);
     });
+
+    if (membersToAdd.length)
+      project.members.push(...membersToAdd);
+    if (invitesToAdd.length)
+      project.invites.push(...invitesToAdd);
 
     await project.save();
 
-    return sendResponse(res, 200, 'Invitation sent', {
-      inviteEmail: normalizedEmail
-    });
+    const message = results.invitationsSent.length || results.addedMembers.length
+      ? 'Invitations processed'
+      : 'No invitations were processed';
+
+    return sendResponse(res, 200, message, { results });
   } catch (err) {
     return handleRouteError(res, 'Invite collaborator error', err);
+  }
+});
+
+/**
+ * @swagger
+ * /projects/{projectId}/invite:
+ *   delete:
+ *     summary: Revoke a pending invitation or remove a member by email
+ *     tags: [Projects]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: projectId
+ *         schema:
+ *           type: string
+ *         required: true
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             anyOf:
+ *               - required: [email]
+ *               - required: [emails]
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 format: email
+ *                 description: Email address to revoke access for
+ *               emails:
+ *                 type: array
+ *                 description: Array of email addresses to revoke access for
+ *                 items:
+ *                   type: string
+ *                   format: email
+ *     responses:
+ *       200:
+ *         description: Invitation revoked or member removed
+ *       400:
+ *         description: Validation error
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden
+ *       404:
+ *         description: Invite/member not found
+ *       500:
+ *         description: Server error
+ */
+router.delete('/:projectId/invite', authMiddleware, async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    const { email, emails } = req.body || {};
+
+    const requestedEmails = [];
+    if (Array.isArray(emails))
+      requestedEmails.push(...emails);
+    if (typeof email === 'string' && email)
+      requestedEmails.push(email);
+
+    const normalizedEntries = requestedEmails.map((raw) => ({
+      raw,
+      normalized: normalizeEmail(raw)
+    }));
+
+    const invalidEmails = normalizedEntries
+      .filter((entry) => !entry.normalized)
+      .map((entry) => entry.raw);
+
+    const normalizedEmails = [
+      ...new Set(
+        normalizedEntries
+          .map((entry) => entry.normalized)
+          .filter(Boolean)
+      )
+    ];
+
+    if (!normalizedEmails.length)
+      return sendResponse(res, 400, 'At least one valid email is required');
+
+    const project = await Project.findOne(buildProjectAccessQuery(projectId, req.user.userId));
+    if (!project)
+      return sendResponse(res, 404, 'Project not found');
+
+    if (!isProjectOwner(project, req.user.userId))
+      return sendResponse(res, 403, 'Only the project owner can revoke invitations');
+
+    project.members = Array.isArray(project.members) ? project.members : [];
+    project.invites = Array.isArray(project.invites) ? project.invites : [];
+
+    const existingUsers = await User.find({ email: { $in: normalizedEmails } });
+    const userByEmail = new Map(
+      existingUsers.map((user) => [normalizeEmail(user.email), user])
+    );
+
+    const result = {
+      membersRemoved: [],
+      invitesCancelled: [],
+      notFound: [],
+      notRemovable: [],
+      invalidEmails
+    };
+
+    normalizedEmails.forEach((normalizedEmail) => {
+      const existingUser = userByEmail.get(normalizedEmail);
+
+      if (existingUser) {
+        const isOwnerTarget = project.owner && String(project.owner) === String(existingUser._id);
+        if (isOwnerTarget) {
+          result.notRemovable.push(normalizedEmail);
+          return;
+        }
+
+        const memberIndex = project.members.findIndex(
+          (member) => member.user && String(member.user) === String(existingUser._id)
+        );
+
+        if (memberIndex > -1) {
+          project.members.splice(memberIndex, 1);
+          result.membersRemoved.push(normalizedEmail);
+          return;
+        }
+      }
+
+      const invite = project.invites.find(
+        (entry) => entry.email === normalizedEmail && entry.status === 'pending'
+      );
+
+      if (invite) {
+        invite.status = 'cancelled';
+        invite.cancelledAt = new Date();
+        result.invitesCancelled.push(normalizedEmail);
+        return;
+      }
+
+      result.notFound.push(normalizedEmail);
+    });
+
+    if (!result.membersRemoved.length && !result.invitesCancelled.length)
+      return sendResponse(
+        res,
+        404,
+        'No pending invites or project members found for the provided emails',
+        { result }
+      );
+
+    await project.save();
+
+    return sendResponse(res, 200, 'Access revoked', { result });
+  } catch (err) {
+    return handleRouteError(res, 'Revoke invite error', err);
   }
 });
 
