@@ -1,5 +1,28 @@
 const swaggerJSDoc = require('swagger-jsdoc');
 
+const port = process.env.PORT || 5000;
+const localServerUrl = `http://localhost:${port}`;
+const deployedServerUrl =
+  process.env.API_BASE_URL ||
+  process.env.RENDER_BASE_URL ||
+  'https://indianjeera.onrender.com';
+
+const servers = [];
+
+if (deployedServerUrl) {
+  servers.push({
+    url: deployedServerUrl,
+    description: 'Deployed environment'
+  });
+}
+
+if (!servers.some(server => server.url === localServerUrl)) {
+  servers.push({
+    url: localServerUrl,
+    description: 'Local development'
+  });
+}
+
 const swaggerDefinition = {
   openapi: '3.0.0',
   info: {
@@ -7,12 +30,7 @@ const swaggerDefinition = {
     version: '1.0.0',
     description: 'Authentication and profile APIs for the Jira clone backend.'
   },
-  servers: [
-    {
-      url: process.env.API_BASE_URL || `http://localhost:${process.env.PORT || 5000}`,
-      description: 'Current environment'
-    }
-  ],
+  servers,
   components: {
     securitySchemes: {
       bearerAuth: {
