@@ -1,6 +1,6 @@
 const express = require('express');
 const mongoose = require('mongoose');
-const Project = require('../models/Project');
+const Project = require('../Models/Project');
 const User = require('../Models/User');
 const authMiddleware = require('../middleware/authMiddleware');
 
